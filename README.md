@@ -1,3 +1,4 @@
+To install the necessary libraries for the power flow algorithm to function correctly, please follow these steps:
 1. Open CMD (Command Prompt) or PowerShell.
 2. Type julia and press Enter.
 3. Once inside Julia (you will see the julia> prompt), copy and paste the following block of code:
