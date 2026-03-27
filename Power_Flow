@@ -1,0 +1,1250 @@
+
+#-----------------------------------------------------PACKAGES------------------------------------------------------#
+
+using LinearAlgebra
+using Statistics
+using Plots
+using Unitful
+using CSV
+using DataFrames
+using XLSX
+
+
+#-------------------------------------------------MATRIZ_DE_BUSES---------------------------------------------------#
+# ------Bus------Type------Pgen(MW)------Qgen(MVAR)------Pdem(MW)------Qdem(MVAR)------magV------angV---- --KV_BASE 
+#     Bus Tipo  Pgenerada(MW)   Qgenerada(MVAR)   Pdemandada(MW)   Qdemandada(MVAR)    Magnitud_Voltaje  Angulo_Voltaje   KV_BASE   
+Buses=[1   1	   0.0               0.0                0.0                0.0	               1.05              0          220.0;
+	   2   3	   0.0               0.0                250	               65                  1.0               0          220.0;
+	   3   2	   150               0.0                0.0	               0.0	               0.9802            0          220.0;
+       4   2	   300               0.0                0.0 	           0.0	               1.01              0          220.0;
+	   5   3	   0.0               0.0	            150 	           60	               1.0               0          220.0];
+
+# JULIA Remind that: @1 is Slack bus@, @2 is PV bar@ and @3 is PQ bar@
+# MATPOWER: #1 es un bus tipo PQ; #2 es un bus tipo PV;  #3 es un bus tipo SL;
+#--------------------------------------------------Branches matrix--------------------------------------------------#
+#             Begin   End     R(pu)     Re (pu)     Estate   No.Line   
+T_lines = [     1      2      0.004     0.040         1        1;
+                1      4      0.002     0.020         1        2;
+                2      3      0.0025    0.025         1        3;
+                3      5      0.004     0.04          1        4;
+                4      5      0.0025    0.025         1        5]; 
+
+function Admittance_matrix_JDDS(T_lines::Array{Float64,2})
+    n = Int(maximum(T_lines[:, 1:2]))  
+    Ybus = zeros(Complex{Float64}, n, n)    
+        for linea in eachrow(T_lines)
+            nodo_inicio = Int(linea[1])
+            nodo_fin = Int(linea[2])
+             R, X, estado = linea[3:5]
+            if estado == 1
+                admitancia = 1 / (R + X*im)  
+                   Ybus[nodo_inicio, nodo_inicio] += admitancia 
+                   Ybus[nodo_fin, nodo_fin] += admitancia
+                   if nodo_inicio != nodo_fin  
+                        Ybus[nodo_inicio, nodo_fin] -= admitancia 
+                       Ybus[nodo_fin, nodo_inicio] -= admitancia
+                   end
+            end
+        end
+        return Ybus
+end
+Ybus = Admittance_matrix_JDDS(T_lines::Array{Float64,2});
+Sbase = 100;
+
+function calcular_flujo_carga(Buses, T_lines, Sbase)
+    Ybus = Admittance_matrix_JDDS(T_lines)
+    alfa = 1
+    error0 = 1e-6
+    maxIter = 15000
+    global Numero_buses = length(Buses[:,1])
+    Pgenerada = Buses[:,3] / Sbase
+    Qgenerada = Buses[:,4] / Sbase
+    Pdemandada = Buses[:,5] / Sbase
+    Qdemandada = Buses[:,6] / Sbase
+    P_esperada = Pgenerada - Pdemandada
+    Q_esperada = Qgenerada - Qdemandada
+    Vbus0 = complex(zeros(Numero_buses,1))
+    Vbus = complex(zeros(Numero_buses,1))
+    Vbus_calculado = complex(zeros(Numero_buses,1))
+    for r in 1:Numero_buses
+        Vbus0[r] = (Buses[r,7]) * (cos(Buses[r,8]*pi/180)) + (Buses[r,7]) * (sin(Buses[r,8]*pi*im/180))
+    end
+    Vbus_h = complex(zeros(Numero_buses, maxIter))
+    Vbus = Vbus0
+    Vbus_h[:,1] = Vbus0
+    error = 1
+    global iter = 0
+    DV = complex(zeros(Numero_buses,1))
+    while iter < maxIter && error > error0
+        global iter += 1
+        for r in 1:Numero_buses
+            if Buses[r,2] == 1
+                # Slack bus
+            elseif Buses[r,2] == 3
+                Isum = 0
+                for m in 1:Numero_buses
+                    if m != r
+                        Isum += Ybus[r,m] * Vbus[m]
+                    end
+                end
+                Vbus_calculado[r] = (((P_esperada[r] - Q_esperada[r]*im) / conj(Vbus[r])) - Isum) / Ybus[r,r]
+                Vbus[r] = Vbus[r] + alfa * (Vbus_calculado[r] - Vbus[r])
+            elseif Buses[r,2] == 2
+                Isum = 0
+                for m in 1:Numero_buses
+                    if m != r
+                        Isum += Ybus[r,m] * Vbus[m]
+                    end
+                end
+                Q_esperada[r] = -imag(conj(Vbus[r]) * ((Ybus[r,r] * Vbus[r]) + Isum))
+                Vbus_calculado[r] = (((P_esperada[r] - Q_esperada[r]*im) / conj(Vbus[r])) - Isum) / Ybus[r,r]
+                Vbus[r] = (abs(Vbus[r]) / abs(Vbus_calculado[r])) * Vbus_calculado[r]
+            end
+        end
+        if iter > 1
+            Vbus_h[:,iter] = Vbus
+            global DV = Vbus_h[:,iter] - Vbus_h[:,iter-1]
+        else
+            global DV = Vbus - Vbus_h[:,iter]
+        end
+        global error = maximum(abs.(DV))
+    end
+     magnitudes = abs.(Vbus_h[:,1:iter])
+     fases = angle.(Vbus_h[:,1:iter]) * 180 / pi  
+    return magnitudes, fases
+end
+
+
+# --------------------Inciamos_el_perfil_de_demanda--------------------#
+demand_profile = [0.413712135249254, 0.3, 0.28, 0.220986029302664, 0.25, 0.3, 0.38, 0.517841121951763, 0.60, 0.78, 0.83, 0.776860738749644, 0.75, 0.65, 0.60, 0.562215077078926, 0.62, 0.74, 0.90, 1.01323071432958, 0.85, 0.59, 0.41, 0.38];
+
+#--------------------INFORMACION_PARA_PERFILES_DE_PV-------------------#
+# Potencia nominal de los generadores en kW
+#P_nom = [922, 576,939, 745]; # POTENCIA DE PRUEBA
+P_nom = [0.0, 0.0, 0.0, 0.0, 0.0]; # AQUI LA POTENCIA ESTA EN kW  
+#P_nom = [0.0, 0.0, 0.0, 0.0, 0.0];
+# Ubicaciones de los generadores en kW
+#g_location = [6, 14, 24, 31, 44, 48];  
+g_location = [1, 2, 3, 4, 5];  
+# Generacion fotovoltaica
+#pv_gen = [0, 0, 0, 0, 0.029, 0.138603398688423, 0.288, 0.495, 0.575, 0.669448743375439, 0.886, 0.91, 0.884, 0.638011583890589, 0.661, 0.352, 0.392, 0.259969723635241, 0.104, 0, 0, 0, 0, 0];
+# PV_GEN_PARA RESPONDER COMENTARIOS DE REVISORES:
+pv_gen = [
+    0.00, 0.00, 0.00, 0.00, 0.00, 0.00,  # 06
+    0.02, 0.10, 0.20, 0.50, 0.75, 0.88,  # 12
+    0.97, 1.00, 0.98, 0.90, 0.72, 0.59,  # 18
+    0.37, 0.09, 0.00, 0.00, 0.00, 0.00   # 24
+];
+#Factor de potencia para cada unidad de Generacion
+fp = [0.98, 0.98, 0.98, 0.98, 0.98];  
+
+#------------------------LOCALIZAR DGUs EOLICOS EN EL SISTEMA (POSICION, Pgen, Qgen, y fp)-------------------------#
+function calcular_potencia_eolica(archivo_csv::String, D::Vector{Float64}, Pmax::Vector{Float64}, Vc::Vector{Float64}, Vr::Vector{Float64}, Vf::Vector{Float64})
+    data = CSV.read("Oklahoma.csv", DataFrame)
+    # Asumimos que las columnas son: la primera columna es 'h' (hora) y la segunda es 'velocidades'
+    global h = data[:, 1];  # Hora
+    global velocidades = data[:, 2];  # Velocidades del viento
+    # Inicializar vectores para cada turbina
+    nf = length(h)
+    Pw2_out = zeros(nf, length(Pmax))  # Potencias eólicas para cada hora y para cada turbina
+    # Parámetros generales del viento
+    rho = 1.225  # Densidad del aire en kg/m^3
+    Cp = 16/27  # Coeficiente de potencia (Límite de Betz)
+    # Cálculo de potencia generada por los generadores eólicos basado en la velocidad del viento
+    for k in 1:nf
+        velk = velocidades[k]  # Velocidad del viento en la hora k
+        for i in 1:length(Pmax)  # Para cada turbina eólica (ubicación)
+            A = π * (D[i] / 2)^2  # Área del rotor para la turbina en la ubicación i
+            if velk < Vc[i]
+                Pw2_out[k, i] = 0.0
+            elseif velk >= Vc[i] && velk <= Vr[i]
+                vm = (velk - Vc[i]) / (Vr[i] - Vc[i])
+                Pw2_out[k, i] = (1/2) * Cp * rho * A * (vm^3)
+                if Pw2_out[k, i] > Pmax[i]  # Limitar a la potencia máxima
+                    Pw2_out[k, i] = Pmax[i]
+                end
+            elseif velk > Vr[i] && velk <= Vf[i]
+                Pw2_out[k, i] = Pmax[i]  # Si la velocidad es mayor o igual a nominal, generar potencia máxima
+            elseif velk > Vf[i]
+                Pw2_out[k, i] = 0.0  # Si supera la velocidad de corte superior, no genera potencia
+            end
+        end
+    end
+    # Retornar el perfil de potencia generada por las turbinas eólicas
+    return Pw2_out
+end
+# Ejemplo: Potencias nominales, diámetros y velocidades de corte diferentes para las 4 localizaciones
+D = [3.7, 4.0, 4.5, 3.8, 3.7];  # Diámetros de las turbinas en metros para cada ubicación
+Pmax = [0.0, 0.0, 0.0, 0.0, 0.0];  # Potencias máximas en kW para cada ubicación
+#Pmax = [0.0, 0.0, 0.0, 0.0];
+Vc = [3.0, 2.5, 3.5, 3.2, 3.0];  # Velocidades de corte inferior para cada turbina
+Vr = [11.0, 11.5, 10.8, 11.0, 11.0];  # Velocidades nominales para cada turbina
+Vf = [24.0, 25.0, 23.0, 24.5, 24.0];  # Velocidades de corte superior para cada turbina
+# Llamar a la función para obtener el perfil de potencia eólica para cada turbina
+Pw2_out = calcular_potencia_eolica("Oklahoma.csv", D, Pmax, Vc, Vr, Vf);
+# Ubicaciones de los generadores eólicos (puede ser diferente o igual a las fotovoltaicas)
+#wind_location = [6, 14, 24, 31, 44, 48];  # Aquí colocas las posiciones de los generadores eólicos
+wind_location = [1, 2, 3, 4, 5]; 
+# Generación eólica calculada previamente (por hora)
+# Factor de potencia para los generadores eólicos
+fp_wind = [0.98, 0.98, 0.98, 0.98, 0.98];
+
+#----------------------------------------------------BATERIAS-------------------------------------------------------#
+# Ubicaciones de las baterías
+#battery_location = [6, 40, 56];  # Buses donde se ubican las baterías
+battery_location = [3, 4, 5]; 
+# Capacidad de almacenamiento de las baterías en kW
+battery_capacity = [0.0, 0.0, 0.0];  # Capacidad máxima de almacenamiento en kW
+# Horas en las que las baterías se cargan (1 PM a 3 PM) y descargan (5 PM a 9 PM)
+charge_hours = 4:7;
+discharge_hours = 18:21;
+
+
+#------------------------Electric Stations / Electrolineras / Cargadores de vehiculos electricos-------------------#
+# Ubicaciones de las electrolineras (en número de bus)
+electrostation_location = [1, 2, 3, 4];  # Ejemplo de buses donde se ubican las electrolineras 35 y 40
+# MENOS CARGADORES:
+#electrostation_location = [10, 40, 52]; 
+# MAS CARGADORES:
+#electrostation_location = [4, 10, 32, 34, 40, 47, 52];
+# OTRAS POSICIONES:
+#electrostation_location = [4, 17, 34, 49, 54];
+# Potencia máxima de carga de cada estación en kW
+#max_charge_power = [300.0, 300.0, 300.0, 300.0, 300.0];  # Potencias máximas de carga para cada estación
+# MENOS CARGADORES:
+max_charge_power = [0.0, 0.0, 0.0, 0.0]; 
+# MAS CARGADORES:
+#max_charge_power = [300.0, 300.0, 300.0, 300.0, 300.0, 300.0, 300.0];
+# Tipo de vehículo asignado a cada electrolinera
+#tipo_vehiculo_por_estacion = ["autobus", "sedan", "van", "autobus", "troka"]; # Se corrigió "autobes" a "autobus"
+tipo_vehiculo_por_estacion = ["sedan", "sedan", "sedan", "sedan"]; 
+# Configuración de temporada y tipo de día
+temporada = "verano" ; # Opciones: "invierno" o "verano"
+tipo_dia = "laboral";  # Opciones: "laboral" o "fin_de_semana"
+
+
+#----------------------------------------------PASSENGER CARS (SEDAN)-----------------------------------------------#
+demand_data_workday_winter = [0.24351, 0.19094, 0.19986, 0.17689, 0.11975, 0.26307, 0.55217, 0.40392, 0.33539, 0.39443, 0.53547, 0.67879, 
+0.59431, 0.63969, 0.85362, 0.75776, 0.99902, 0.91227, 0.82552, 0.82533, 0.60647, 0.49237, 0.50130, 0.43277];
+
+demand_data_weekend_winter = [0.26457, 0.15614, 0.15144, 0.10481, 0.078043, 0.066724, 0.10619, 0.17214, 0.47868, 0.47620, 0.54879, 0.44917, 
+0.69612, 0.74883, 0.81698, 0.56064, 0.65750, 0.62190, 0.62162, 0.97895, 0.88599, 0.74661, 0.58521, 0.46794];
+
+demand_data_workday_summer = [0.30880, 0.20236, 0.16114, 0.12427, 0.093921, 0.24401, 0.44627, 0.63114, 0.66818, 0.58348, 0.66183, 0.72714,
+0.70332, 0.72731, 0.86218, 0.99269, 0.79713, 0.87548, 0.91470, 0.95826, 0.64095, 0.61495, 0.41939, 0.41947];
+
+demand_data_weekend_summer = [0.21875, 0.11830, 0.093750, 0.069196, 0.042411, 0.033482, 0.035714, 0.064732, 0.20759, 0.30580, 0.44196, 0.79911, 
+0.99554, 0.97768, 0.67188, 0.62277, 0.48438, 0.52232, 0.79464, 0.57366, 0.52455, 0.47545, 0.27902, 0.33259];
+#----------------------------------------------------Electric_Buses--------------------------------------------------#
+buses_workday_winter = [0.83764, 0.91681, 0.91674, 0.91665, 0.91847, 0.91650, 0.52774, 0.20313, 0.12193, 0.15581, 0.89339, 0.58592,
+0.79142, 0.53097, 0.46674, 0.69119, 0.89489, 0.99104, 0.66266, 0.15880, 0.066270, 0.14166, 0.31329, 0.61698];
+
+buses_weekend_winter = [0.89831, 0.96102, 0.96102, 0.96441, 0.96102, 0.96102, 0.57458, 0.32373, 0.20339, 0.22881, 0.53559, 0.56271, 0.69831, 
+0.52034, 0.51525, 0.49492, 0.73898, 0.99831, 0.74576, 0.21864, 0.12034, 0.20169, 0.36441, 0.62373];
+
+buses_workday_summer = [0.73250, 0.78403, 0.78410, 0.78417, 0.77910, 0.78088, 0.45677, 0.18926, 0.10528, 0.10707, 0.46048, 0.83277, 0.92890, 0.58077, 
+0.45048, 0.50372, 0.71820, 0.99443, 0.73893, 0.21928, 0.049537, 0.10621, 0.26066, 0.53174];
+
+buses_weekend_summer = [0.87412, 0.93063, 0.92845, 0.93045, 0.92408, 0.92190, 0.65138, 0.39133, 0.22562, 0.19618, 0.35962, 0.60691, 
+0.86888, 0.76607, 0.59197, 0.56464, 0.70501, 0.99423, 0.73418, 0.20999, 0.14282, 0.21611, 0.36696, 0.60167];
+#----------------------------------------------------------VANS-------------------------------------------------------#
+vans_workday_winter = [0.92399, 0.92586, 0.92569, 0.92962, 0.91920, 0.89444, 0.80616, 0.65435, 0.52508, 0.45934, 0.53704, 0.72333, 0.87276, 0.90947, 0.98308, 0.99315, 0.80651, 
+0.51330, 0.44961, 0.60107, 0.75254, 0.83434, 0.88540, 0.92212];
+
+vans_weekend_winter = [0.91024, 0.90848, 0.91179, 0.91003, 0.90996, 0.88282, 0.81676, 0.67963, 0.54420, 0.46968, 0.52206, 0.74026,
+0.94662, 0.98377, 1.0006, 0.98363, 0.67730, 0.52495, 0.46396, 0.60095, 0.76501, 0.82585, 0.87485, 0.90185];
+
+vans_workday_summer = [0.90476, 0.90291, 0.90617, 0.90772, 0.90419, 0.88198, 0.79186, 0.64740, 0.52842, 0.48922, 0.54511, 0.75549, 0.90136,
+0.96403, 0.99445, 0.95017, 0.65292, 0.52035, 0.46927, 0.59307, 0.75082, 0.82538, 0.87278, 0.90489];
+
+vans_weekend_summer = [0.89948, 0.89939, 0.89721, 0.89713, 0.89913, 0.86976, 0.79227, 0.65201, 0.50757, 0.51376, 0.62455, 0.62865, 0.78965, 0.80839,
+0.84806, 0.99441, 0.67842, 0.47122, 0.49624, 0.57147, 0.73247, 0.80979, 0.86828, 0.89748];
+#-----------------------------------------------------------TROKAS-----------------------------------------------------#
+troka_workday_winter = [0.63619, 0.74067, 0.82463, 0.84515, 0.85634, 0.91978, 0.99813, 1.0037, 0.99440, 0.97388, 0.96082,
+0.94590, 0.88806, 0.80410, 0.65112, 0.51119, 0.35261, 0.24067, 0.14179, 0.12313, 0.15299, 0.24067, 0.38246, 0.56530];
+
+troka_weekend_winter = [0.71883, 0.84823, 0.99466, 0.99289, 0.92297, 0.86157, 0.85469, 0.83758, 0.83240, 0.83403, 0.83566, 
+0.88670, 0.89855, 0.86612, 0.78768, 0.70073, 0.63422, 0.56771, 0.51823, 0.51305, 0.51979, 0.52313, 0.52987, 0.50936];
+
+troka_workday_summer = [0.59974, 0.73098, 0.81453, 0.87593, 0.88963, 0.91525, 0.98858, 0.99546, 0.99043, 0.97857, 0.95650, 
+0.93101, 0.89360, 0.83405, 0.71828, 0.51392, 0.36578, 0.24490, 0.15638, 0.10705, 0.11394, 0.17874, 0.32873, 0.49234];
+
+troka_weekend_summer = [0.76260, 0.87102, 0.99819, 0.99828, 0.87961, 0.83387, 0.83396, 0.82988, 0.82996, 0.82380, 0.81555,
+0.85730, 0.85947, 0.80956, 0.70548, 0.65557, 0.60774, 0.58491, 0.52666, 0.52467, 0.56433, 0.61234, 0.64992, 0.57293];
+
+
+#----------------------------------------DICCIONARIO PARA EL TIPO DE VEHICULOS------------------------------------------#
+perfiles_carga = Dict(
+    "sedan" => Dict(
+        "invierno" => Dict("laboral" => demand_data_workday_winter, "fin_de_semana" => demand_data_weekend_winter),
+        "verano" => Dict("laboral" => demand_data_workday_summer, "fin_de_semana" => demand_data_weekend_summer)
+    ),
+    "autobus" => Dict(
+        "invierno" => Dict("laboral" => buses_workday_winter, "fin_de_semana" => buses_weekend_winter),
+        "verano" => Dict("laboral" => buses_workday_summer, "fin_de_semana" => buses_weekend_summer)
+    ),
+    "van" => Dict(
+        "invierno" => Dict("laboral" => vans_workday_winter, "fin_de_semana" => vans_weekend_winter),
+        "verano" => Dict("laboral" => vans_workday_summer, "fin_de_semana" => vans_weekend_summer)
+    ),
+    "troka" => Dict(
+        "invierno" => Dict("laboral" => troka_workday_winter, "fin_de_semana" => troka_weekend_winter),
+        "verano" => Dict("laboral" => troka_workday_summer, "fin_de_semana" => troka_weekend_summer)
+    )
+);
+
+#---------------------------Funcion para determinar la carga segun el tipo de vehiculo y temporada----------------------#
+function calcular_carga_estaciones_diaria(tipo_dia, temporada, tipo_vehiculo_por_estacion)
+    carga_diaria = zeros(24, length(electrostation_location))
+    
+    for i in 1:length(electrostation_location)
+        vehiculo = tipo_vehiculo_por_estacion[i]
+
+        if !haskey(perfiles_carga, vehiculo)
+            error("Error: El tipo de vehículo '$vehiculo' no es válido. Use: 'sedan', 'autobus', 'van' o 'troka'.")
+        end
+
+        perfil = perfiles_carga[vehiculo][temporada][tipo_dia]
+        carga_diaria[:, i] = perfil .* max_charge_power[i]
+    end
+    
+    return carga_diaria
+end
+
+carga_diaria = calcular_carga_estaciones_diaria(tipo_dia, temporada, tipo_vehiculo_por_estacion);
+
+function calcular_potencia_slack(Buses, Ybus, Vbus, Sbase)
+    # Voltaje en el bus slack
+    V_slack = Vbus[1]  
+    # Calcular la corriente inyectada en el bus slack
+    I_slack = sum(Ybus[1, :] .* Vbus)
+    # Calcular la potencia compleja generada en el bus slack
+    S_slack = Sbase * V_slack * conj(I_slack)
+    # Separar la potencia real y reactiva
+    P_slack = real(S_slack)  # Potencia real en MW
+    Q_slack = imag(S_slack)  # Potencia reactiva en MVAr 
+    return P_slack, Q_slack
+end
+
+function calcular_flujo_carga_horario(Buses, T_lines, demand_profile, P_nom, g_location, pv_gen, fp, wind_location, Pw2_out, fp_wind, battery_location, battery_capacity, charge_hours, discharge_hours, Ybus, Sbase, electrostation_location, carga_diaria)
+    resultados_magnitudes = [];
+    resultados_fases = [];
+    resultados_P_slack = [];
+    resultados_Q_slack = [];
+    
+    for hora in 1:24
+        Buses_hora = copy(Buses)
+        
+        for i in 1:size(Buses, 1)
+            Buses_hora[i, 5] *= demand_profile[hora]  
+            Buses_hora[i, 6] *= demand_profile[hora]  
+        end
+        
+        for (i, bus) in enumerate(electrostation_location)
+            Buses_hora[bus, 5] += carga_diaria[hora, i] / 1000  
+        end
+
+    
+        for (generation, bus) in enumerate(g_location)
+            Pgen = P_nom[generation] / 1000 * pv_gen[hora]  # Convertir kW a MW
+            Buses_hora[bus, 3] += Pgen  
+            Qgen = Pgen * tan(acos(fp[generation]))  
+            Buses_hora[bus, 4] += Qgen
+        end
+        
+        for (i, bus) in enumerate(wind_location)
+            Pgen = Pw2_out[hora, i] / 1000  
+            Buses_hora[bus, 3] += Pgen  
+            Qgen = Pgen * tan(acos(fp_wind[i]))  
+            Buses_hora[bus, 4] += Qgen
+        end
+        
+        for (idx, bus) in enumerate(battery_location)
+            if hora in charge_hours
+                carga_bateria = battery_capacity[idx] / 1000  
+                Buses_hora[bus, 5] += carga_bateria 
+            elseif hora in discharge_hours
+                generacion_bateria = battery_capacity[idx] / 1000  
+                Buses_hora[bus, 3] += generacion_bateria 
+            end
+        end
+        
+        magnitudes, fases = calcular_flujo_carga(Buses_hora, T_lines, Sbase)
+        
+        push!(resultados_magnitudes, magnitudes[:, end])
+        push!(resultados_fases, fases[:, end])
+        
+        Vbus = magnitudes[:, end] .* exp.(im * fases[:, end] * pi / 180)
+        
+        P_slack, Q_slack = calcular_potencia_slack(Buses_hora, Ybus, Vbus, Sbase)
+        push!(resultados_P_slack, P_slack)
+        push!(resultados_Q_slack, Q_slack)
+    end 
+    
+    return hcat(resultados_magnitudes...), hcat(resultados_fases...), resultados_P_slack, resultados_Q_slack
+end
+
+magnitudes_horario, fases_horario, P_slack_horario, Q_slack_horario = calcular_flujo_carga_horario(Buses, T_lines, demand_profile, P_nom, g_location, pv_gen, fp, wind_location, Pw2_out, fp_wind,
+battery_location, battery_capacity, charge_hours, discharge_hours, Ybus, Sbase, electrostation_location, carga_diaria)
+for hora in 1:24
+    println("Hora $hora:")
+    println("Magnitudes de voltaje: ", magnitudes_horario[:, hora])
+    println("Fases de voltaje: ", fases_horario[:, hora])
+    # println("Potencia real suministrada por el bus slack: ", P_slack_horario[hora], " MW")
+    # println("Potencia reactiva suministrada por el bus slack: ", Q_slack_horario[hora], " MVAr")
+end
+
+#------------------------CALCULAR LOS VOLTAJES PROMEDIOS PARA CADA HORA DEL PERFIL DE DEMANDA-----------------------#
+
+promedios_voltajes = []; # DEBO INICIAR UN ARRAY PARA GUARDAR LOS PROMEDIOS DE VOLTAJE PARA HACER LA GRÁFICA
+for hora in 1:24
+    voltaje_promedio_hora = round(mean(magnitudes_horario[:, hora]), digits=4) # Redondear a 4 decimales
+    println("Voltaje promedio para la hora $hora: ", voltaje_promedio_hora)
+    push!(promedios_voltajes, voltaje_promedio_hora)  # Guardar el voltaje promedio en el array
+end
+
+promedio_de_promedios = round(mean(promedios_voltajes), digits=4); 
+println("El promedio de los voltajes promedios es: ", promedio_de_promedios)
+
+#----------------------------CALCULAR_PERDIDAS_Y_FLUJOS_DE_POTENCIA_Y_CORRIENTES------------------------------------#
+function calcular_flujos_y_perdidas_con_corrientes(T_lines, magnitudes_horario, fases_horario, Buses, S_base)
+    T_lines_activas = T_lines[T_lines[:, 5] .== 1, :]
+    n_lt = size(T_lines_activas, 1)
+    global bus_from = Int.(T_lines_activas[:, 1])
+    global bus_to = Int.(T_lines_activas[:, 2])
+    Vbus = [magnitudes_horario[h] * exp(im * deg2rad(fases_horario[h])) for h in 1:length(magnitudes_horario)]
+    S_loss = complex(zeros(n_lt))
+    S_flow = complex(zeros(n_lt))
+    corrientes_pu = complex(zeros(n_lt))  
+    corrientes_reales = zeros(n_lt)  
+    Ptot_real = 0.0
+    Qtot_reactive = 0.0
+    Stot_loss = complex(0.0)
+    for h in 1:n_lt
+        Z_tl = T_lines_activas[h, 3] + T_lines_activas[h, 4] * im
+        I_pu = (Vbus[bus_from[h]] - Vbus[bus_to[h]]) / Z_tl
+        corrientes_pu[h] = I_pu  
+        S_flow[h] = Vbus[bus_from[h]] * conj(I_pu)
+        V_base_from_bus = (Buses[bus_from[h], 9]) / 1000  
+        I_base = S_base / (sqrt3 * V_base_from_bus)  
+        corrientes_reales[h] = abs(I_pu) * I_base
+        P_loss_real = (abs(I_pu)^2 * real(Z_tl)) * S_base
+        Q_loss_reactive = (abs(I_pu)^2 * imag(Z_tl)) * S_base
+        S_loss[h] = P_loss_real + Q_loss_reactive * im
+        Stot_loss += S_loss[h]
+        Ptot_real += P_loss_real
+        Qtot_reactive += Q_loss_reactive
+    end
+    return S_flow, corrientes_pu, corrientes_reales, Stot_loss, Ptot_real, Qtot_reactive, S_loss
+end
+
+#---------------------------------------FLUJO_DE_POTENCIAS----------------------------------------#
+
+# Inicializar arrays/vectores para almacenar las pérdidas totales por hora
+Ptot_real_por_hora = zeros(24);
+Qtot_reactive_por_hora = zeros(24);
+Stot_loss_por_hora = complex(zeros(24));
+S_base = 100; 
+sqrt3 = sqrt(3); 
+for hora in 1:24
+    magnitudes = magnitudes_horario[:, hora]
+    fases = fases_horario[:, hora]
+    T_lines_activas = T_lines[T_lines[:, 5] .== 1, :]
+
+    S_flow, corrientes_pu, corrientes_reales, Stot_loss, Ptot_real, Qtot_reactive, S_loss = calcular_flujos_y_perdidas_con_corrientes(T_lines_activas, magnitudes, fases, Buses, S_base)
+
+    Ptot_real_por_hora[hora] = Ptot_real
+    Qtot_reactive_por_hora[hora] = Qtot_reactive
+    
+    println("Hora $hora:")
+    println("Pérdidas totales reales de potencia: ", round(Ptot_real, digits = 9), " MW")
+    println("Pérdidas totales reactivas de potencia: ", round(Qtot_reactive, digits = 9), " MVAr")
+    println("Pérdidas totales aparentes de potencia: ", round(Stot_loss, digits = 9), " MVA")
+    println("Potencia real suministrada por el bus slack: ", P_slack_horario[hora], " MW")
+    println("Potencia reactiva suministrada por el bus slack: ", Q_slack_horario[hora], " MVAr")
+    
+    println("Flujos de potencia en cada línea activa:")
+    for i in 1:size(T_lines_activas, 1)
+        bus_origen = T_lines_activas[i, 1]
+        bus_destino = T_lines_activas[i, 2]
+        
+        P_real = (real(S_flow[i])) * S_base  
+        Q_reactive = imag(S_flow[i]) * S_base  
+        S_apparent = sqrt((P_real)^2 + (Q_reactive)^2)  
+        
+        println("Línea $(T_lines_activas[i, 6]) (Bus $bus_origen -> Bus $bus_destino):")
+        println("    Potencia real: ", round(P_real, digits = 9), " MW")
+        println("    Potencia reactiva: ", round(Q_reactive, digits = 9), " MVAr")
+        println("    Potencia aparente: ", round(S_apparent, digits = 9), " MVA")
+        println("    Corriente real: ", round(corrientes_reales[i], digits = 9), " A")
+    end
+    
+    println("Corrientes en cada línea activa:")
+    for i in 1:size(T_lines_activas, 1)
+        bus_origen = T_lines_activas[i, 1]
+        bus_destino = T_lines_activas[i, 2]
+        
+        println("Línea $(T_lines_activas[i, 6]) (Bus $bus_origen -> Bus $bus_destino): Corriente real: ", round(corrientes_reales[i], digits = 9), " A")
+    end
+end
+
+println("Pérdidas reales totales por hora (MW):")
+for hora in 1:24
+    println("Hora $hora: ", round(Ptot_real_por_hora[hora], digits=4), " MW")
+end
+
+suma_perdidas_reales = sum(Ptot_real_por_hora);
+println("\nSuma total de las pérdidas reales: ", round(suma_perdidas_reales, digits=4), " MW")
+
+Prom_dia_loss = suma_perdidas_reales / 24;
+println("Promedio diario de pérdidas reales: ", round(Prom_dia_loss, digits=4), " MW")
+
+"""
+#--------------------------------------Saturacion_del_los_transformadores--------------------------------#
+S_flow_resultados = Dict(linea => [] for linea in [38, 43, 54, 56]);
+Ptot_real_por_hora = zeros(24);
+Qtot_reactive_por_hora = zeros(24);
+Stot_loss_por_hora = complex(zeros(24));
+S_base = 10; 
+
+for hora in 1:24
+    magnitudes = magnitudes_horario[:, hora]
+    fases = fases_horario[:, hora]
+    T_lines_activas = T_lines[T_lines[:, 5] .== 1, :]
+    S_flow, corrientes_pu, corrientes_reales, Stot_loss, Ptot_real, Qtot_reactive, S_loss = calcular_flujos_y_perdidas_con_corrientes(T_lines_activas, magnitudes, fases, Buses, S_base)
+
+    for linea in [38, 43, 54, 56]
+        pos_linea = findfirst(==(linea), T_lines_activas[:, 6])  
+        if pos_linea !== nothing 
+            push!(S_flow_resultados[linea], abs(S_flow[pos_linea]) * S_base)  
+        else
+            push!(S_flow_resultados[linea], 0.0)  
+        end
+    end
+end
+
+
+println("Flujos de potencia aparente (MVA) por línea seleccionada:")
+for linea in keys(S_flow_resultados)
+    println("Línea $linea:")
+    for hora in 1:24
+        println("  Hora $hora: ", round(S_flow_resultados[linea][hora], digits=6), " MVA")
+    end
+    println()
+end
+
+
+capacidades_nominales = Dict(38 => 5.0, 43 => 2.0, 54 => 4.0, 56 => 0.5);
+println("Flujos de potencia aparente en por unidad (p.u.) por línea seleccionada:")
+promedios_pu = Dict();  
+for linea in keys(S_flow_resultados)
+    println("Línea $linea (Capacidad nominal: ", capacidades_nominales[linea], " MVA):")
+    flujos_pu = Float64[] 
+    
+    for hora in 1:24
+        flujo_pu = S_flow_resultados[linea][hora] / capacidades_nominales[linea] 
+        flujo_pu_redondeado = round(flujo_pu, digits=4)  
+        push!(flujos_pu, flujo_pu_redondeado) 
+        println("  Hora $hora: ", flujo_pu_redondeado, " p.u.")
+    end
+    
+    promedio_pu = round(mean(flujos_pu), digits=4) 
+    promedios_pu[linea] = promedio_pu
+    
+    println("Promedio de 24 horas para la línea $linea: ", promedio_pu, " p.u.\n")
+end
+
+println("Resumen de los promedios de las 24 horas:")
+for linea in keys(promedios_pu)
+    println("Línea $linea: Promedio = ", round(promedios_pu[linea], digits=6), " p.u.")
+end
+
+"""
+"""
+#-----------------------------------------------GRAFICAS_DE_RESULTADOS----------------------------------------------#
+"""
+"""
+#----------------INICIAR GRAFICA PARA LA DEMANDA TOTAL, GENERADORES, PERFIL DE GENERACION DEL SISTEMA---------------#
+
+# Calcular demanda_normal_por_hora fuera de la función principal
+demanda_normal_por_hora = [sum(Buses[i, 5] * demand_profile[hora] for i in 1:size(Buses, 1)) for hora in 1:24];
+p1 = plot(1:24, demanda_normal_por_hora, 
+    linecolor="blue",      # Color de la línea
+    marker=:circle,        # Estilo de marcador
+    markercolor="red",     # Color de los puntos (marcadores)
+    label="Demanda (MW)", 
+    #xlabel="Hora del día", 
+    #ylabel="Demanda (MW)", 
+    title=["Perfil de demanda" font(120, :bold)], 
+    lw=1,                  # Grosor de la línea
+    legend=:topleft,
+    xticks=1:1:24,
+    yticks=0.0:2.0:20.0,
+    ylim=(0.0, 20.0),     # Establecer los límites del eje Y
+    grid=true,             # Activar la cuadrícula
+    gridalpha=0.9,         # Transparencia de la cuadrícula (0.3 es más tenue)
+    markerstrokewidth=0.1,
+    legendfontsize=12,
+    gridcolor=:gray,       # Color de la cuadrícula
+    titlefontsize=12,     # Tamaño de la fuente del título
+    tickfontsize=12,      # Tamaño de la fuente de las etiquetas de los ticks
+    guidefontsize=7)      # Tamaño de la fuente de los ejes
+
+    
+##################################################################################################
+
+
+# Subplot 2: Voltaje promedio por hora
+p2 = plot(1:24, promedios_voltajes, 
+    linecolor="green",     # Color de la línea
+    marker=:circle,        # Estilo de marcador
+    markercolor="red",     # Color de los puntos (marcadores)
+    label="Voltaje promedio (p.u.)", 
+    #xlabel="Hora del día", 
+    #ylabel="Voltaje promedio (p.u.)", 
+    title="Voltaje Promedio por Hora", 
+    lw=1,                  # Grosor de la línea
+    legend=:topright,
+    xticks=1:1:24,         # Etiquetas en el eje X de 1 en 1
+    yticks=0.90:0.03:1.02,
+    ylim=(0.90, 1.02),         # Establecer los límites del eje Y
+    grid=true,             # Activar la cuadrícula
+    gridalpha=0.9,         # Transparencia de la cuadrícula
+    markerstrokewidth=0.1,
+    gridcolor=:gray,       # Color de la cuadrícula
+    legendfontsize=12,
+    titlefontsize=12,     # Tamaño de la fuente del título
+    tickfontsize=12,      # Tamaño de la fuente de las etiquetas de los ticks
+    guidefontsize=7)      # Tamaño de la fuente de los ejes
+
+
+#--------------------------AVERAGE VOLTAGE FOR EACH HOUR FROM DEMAND PROFILE--------------------------#
+# Crear el DataFrame solo con las horas y los voltajes promedio
+horas = 1:24
+data_voltajes = DataFrame(
+    Hora = horas,
+    Voltaje_Promedio = promedios_voltajes
+)
+# Guardar el DataFrame en un archivo Excel
+XLSX.writetable("Voltajes_Promedio_BESS_DGU.xlsx", data_voltajes; sheetname="Voltajes Promedio")
+
+#println("Archivo 'Voltajes_Promedio.xlsx' creado exitosamente.")
+#------------------------------------------------------------------------------------------------------#
+
+
+##################################################################################################
+#----------------------Definir flujo de carga y descarga de las baterías-------------------------#
+flujo_baterias = zeros(3, 24);  # Para tres baterías en cada hora
+# Llenar el flujo de carga y descarga de cada batería en cada hora
+for hora in 1:24
+    for (idx, capacidad) in enumerate(battery_capacity)
+        if hora in charge_hours
+            flujo_baterias[idx, hora] = -capacidad / 1000  # Flujo negativo indica carga en MW
+        elseif hora in discharge_hours
+            flujo_baterias[idx, hora] = capacidad / 1000   # Flujo positivo indica descarga en MW
+        end
+    end
+end
+
+# Código para graficar
+p3 = plot(1:24, flujo_baterias[1, :], 
+    linecolor="blue",      # Color de la línea para la primera batería
+    marker=:circle,        # Estilo de marcador
+    markercolor="red",     # Color de los puntos (marcadores)
+    label="Flujo de baterías B1 (MW)", 
+    title="Flujo de Carga/Descarga de Baterías", 
+    lw=1,                  # Grosor de la línea
+    legend=:topleft,
+    xticks=1:2:24,         # Etiquetas en el eje X de 2 en 2
+    yticks=-4.5:0.5:4.5,
+    ylim=(-4.5, 4.5),      # Establecer los límites del eje Y
+    xlim=(0.0, 24),
+    grid=true,             # Activar la cuadrícula
+    gridalpha=0.9,         # Transparencia de la cuadrícula
+    markerstrokewidth=0.1,
+    gridcolor=:gray,       # Color de la cuadrícula
+    legendfontsize=12,
+    titlefontsize=12,      # Tamaño de la fuente del título
+    tickfontsize=12,       # Tamaño de la fuente de las etiquetas de los ticks
+    guidefontsize=7)       # Tamaño de la fuente de los ejes
+
+# Agregar la segunda batería al mismo gráfico
+plot!(p3, 1:24, flujo_baterias[2, :], 
+    linecolor="green",    # Color de la línea para la segunda batería
+    marker=:diamond,      # Estilo de marcador para la segunda batería
+    markercolor="orange", # Color de los puntos (marcadores)
+    markerstrokewidth=0.1,
+    label="Flujo de baterías B2 (MW)", 
+    lw=1)
+
+# Agregar la tercera batería al mismo gráfico
+plot!(p3, 1:24, flujo_baterias[3, :], 
+    linecolor="red",      # Color de la línea para la tercera batería
+    marker=:diamond,      # Estilo de marcador para la tercera batería
+    markercolor="blue",   # Color de los puntos (marcadores)
+    markerstrokewidth=0.1,
+    label="Flujo de baterías B3 (MW)", 
+    lw=1)
+
+# Agregar la segunda batería al mismo gráfico
+#plot!(p3, 1:24, flujo_baterias[4, :], 
+#linecolor="red",    # Color de la línea para la segunda batería
+#marker=:diamond,      # Estilo de marcador para la segunda batería
+#markercolor="blue", # Color de los puntos (marcadores)
+#markerstrokewidth=0.1,
+#label="Potencia de baterias B3 (MW)", 
+#lw=1)
+
+##################################################################################################
+# Calcular demanda total ajustada por las baterías
+demanda_total_ajustada_por_baterias = copy(demanda_normal_por_hora);  # Copiar la demanda normal
+
+# Ajustar la demanda según las horas de carga y descarga de las baterías
+for hora in 1:24
+    for (idx, capacidad) in enumerate(battery_capacity)
+        if hora in charge_hours
+            # Si está en hora de carga, aumentamos la demanda
+            demanda_total_ajustada_por_baterias[hora] += capacidad / 1000  # Convertir kW a MW
+        elseif hora in discharge_hours
+            # Si está en hora de descarga, disminuimos la demanda
+            demanda_total_ajustada_por_baterias[hora] -= capacidad / 1000
+        end
+    end
+end
+# Subplot 4: Perfil de demanda ajustado por las baterías
+p4 = plot(1:24, demanda_total_ajustada_por_baterias, 
+    linecolor="purple",    
+    marker=:circle,        
+    markercolor="blue",    
+    label="Demanda ajustada (MW)", 
+    #ylabel="Demanda ajustada (MW)", 
+    title="Perfil de Demanda Ajustado por Baterías", 
+    lw=1,                  
+    legend=:topleft,
+    xticks=1:1:24,         
+    yticks=0:2:20,
+    ylim=(0, 20),         
+    grid=true,             
+    gridalpha=0.9,         
+    markerstrokewidth=0.1,
+    gridcolor=:gray,
+    legendfontsize=12,
+    titlefontsize=12,     # Tamaño de la fuente del título
+    tickfontsize=12,      # Tamaño de la fuente de las etiquetas de los ticks
+    guidefontsize=7)      # Tamaño de la fuente de los ejes
+
+##################################################################################################
+#--------------------------------Pérdidas totales reales por hora--------------------------------#
+p5 = plot(1:24, Ptot_real_por_hora, 
+    linecolor="blue",      # Color de la línea
+    marker=:circle,        # Estilo de marcador
+    markercolor="red",     # Color de los puntos (marcadores)
+    label="Pérdidas reales (MW)", 
+    #xlabel="Hora del día", 
+    #ylabel="Pérdidas reales (MW)", 
+    yticks=0.0:0.3:2.5,
+    ylim=(0.0, 2.5),
+    title="Pérdidas Totales Reales por Hora", 
+    lw=1,                  # Grosor de la línea
+    legend=:topleft,
+    grid=true,             # Activar la cuadrícula
+    gridalpha=0.9,
+    markerstrokewidth=0.1,
+    gridcolor=:gray,
+    xticks=1:1:24,
+    legendfontsize=12,
+    titlefontsize=12,     # Tamaño de la fuente del título
+    tickfontsize=12,      # Tamaño de la fuente de las etiquetas de los ticks
+    guidefontsize=7)      # Tamaño de la fuente de los ejes
+
+#------------------------------REAL POWER LOSSES IN EACH HOUR FOR PYTHON----------------------------#
+    # Crear el DataFrame solo con las pérdidas totales por hora
+    horas = 1:24
+    data = DataFrame(
+            Hora = horas,
+            Pérdidas_Totales_Reales = Ptot_real_por_hora  # Pérdidas totales reales del sistema por hora
+        )
+        # Guardar el DataFrame en un archivo Excel en una hoja llamada "Pérdidas Totales"
+        XLSX.writetable("Pérdidas_Totales_CON_BATERIAS_Y_DGU.xlsx", data; sheetname="Pérdidas Totales")
+        println("Archivo 'Pérdidas_Totales.xlsx' creado exitosamente.")
+#--------------------------------------------------------------------------------------------------#
+
+
+
+######################################################################################################
+#---------------------------------Pérdidas totales reactivas por hora--------------------------------#
+
+
+p6 = plot(1:24, Qtot_reactive_por_hora, 
+    linecolor="green",     # Color de la línea
+    marker=:circle,        # Estilo de marcador
+    markercolor="red",     # Color de los puntos (marcadores)
+    label="Pérdidas reactivas (MVAr)", 
+    #xlabel="Hora del día", 
+    #ylabel="Pérdidas reactivas (MVAr)", 
+    title="Pérdidas Totales Reactivas por Hora", 
+    yticks=0.0:0.3:2.5,
+    ylim=(0.0, 2.5),
+    lw=1,                  # Grosor de la línea
+    grid=true,             # Activar la cuadrícula
+    gridalpha=0.9,
+    markerstrokewidth=0.1,
+    gridcolor=:gray,
+    legend=:topleft,
+    legendfontsize=12,
+    xticks=1:1:24,
+    titlefontsize=12,     # Tamaño de la fuente del título
+    tickfontsize=12,      # Tamaño de la fuente de las etiquetas de los ticks
+    guidefontsize=7)      # Tamaño de la fuente de los ejes
+
+##################################################################################################
+#--------------------Crear el gráfico del perfil de generación fotovoltaica----------------------#
+
+
+
+p7 = plot(1:24, pv_gen * 1000, 
+    linecolor="red",    # Color de la línea para el perfil de generación
+    marker=:circle,        # Estilo de marcador
+    markercolor="blue",      # Color de los puntos (marcadores)
+    label="Perfil PV (p.u.)", 
+    xlabel="Hora del día", 
+    ylabel="Generación (kW)", 
+    title="Perfil de Generación Fotovoltaica y Potencia por Generador", 
+    lw=5,                  # Grosor de la línea
+    legend=:topright,
+    xticks=1:1:24,         # Etiquetas en el eje X de 1 en 1
+    yticks=0:100.0:1000.0, # Etiquetas en el eje Y
+    ylim=(0.0, 1000.0),    # Establecer los límites del eje Y
+    grid=true,             # Activar la cuadrícula
+    gridalpha=0.9,         # Transparencia de la cuadrícula
+    markerstrokewidth=0.1,
+    legendfontsize=12,
+    gridcolor=:gray,       # Color de la cuadrícula
+    titlefontsize=12,      # Tamaño de la fuente del título
+    tickfontsize=12,        # Tamaño de la fuente de las etiquetas de los ticks
+    guidefontsize=7)       # Tamaño de la fuente de los ejes
+
+# Potencia generada para cada generador en cada hora
+P_gen_por_generador = [P_nom[g] * pv_gen for g in 1:length(P_nom)];
+
+# Añadir las curvas de los generadores al mismo gráfico
+for g in 1:length(g_location)
+    plot!(1:24, P_gen_por_generador[g], 
+        linecolor=rand([:green, :red, :blue, :green, :brown, :pink]),  # Colores aleatorios para distinguir las líneas
+        marker=:circle,       # Estilo de marcador
+        markercolor=rand([:green, :red, :blue, :green, :brown, :pink]),    # Color de los puntos (marcadores)
+        label="PV Bus $(g_location[g])", 
+        lw=2,                # Grosor de la línea
+        markerstrokewidth=0.1)
+end
+
+##################################################################################################
+#----------------------------Crear el gráfico del perfil de viento-------------------------------#
+
+p_wp = plot(h, velocidades, 
+    linecolor="blue",      # Color de la línea para el perfil de viento
+    marker=:circle,        # Estilo de marcador
+    markercolor="red",     # Color de los puntos (marcadores)
+    label="Velocidad del viento (m/s)", 
+    #ylabel="Velocidad del viento (m/s)",  # Eje Y izquierdo para la velocidad
+    title="Perfil de Velocidad del Viento y Generación de Potencia Eólica", 
+    lw=5,                  # Grosor de la línea
+    legend=:topleft,
+    grid=true,             # Activar la cuadrícula
+    gridalpha=0.9,         # Transparencia de la cuadrícula
+    markerstrokewidth=0.1,
+    #legendfontsize=12,
+    titlefontsize=12,     # Tamaño de la fuente del título
+    tickfontsize=12,       # Tamaño de la fuente de las etiquetas de los ticks
+    guidefontsize=7,      # Tamaño de la fuente de los ejes
+    gridcolor=:gray)       # Color de la cuadrícula
+# Añadir la generación de potencia de cada turbina con el eje derecho SEGUN.....
+plot!(h, Pw2_out[:, 1], 
+    linecolor="green",           # Color de la línea para la primera turbina
+    marker=:circle,              # Estilo de marcador para la primera turbina
+    markerstrokewidth=0.1,
+    markercolor="red",           # Color de los puntos (marcadores)
+    label="Turbina 1 (kW x 100)", 
+    lw=1,                        # Grosor de la línea
+    yticks=0:1.0:9.5,            # Etiquetas en el eje Y derecho
+    ylim=(0, 9.5),               # Establecer los límites del eje Y derecho
+    right_axis=true,             # Activar el eje derecho
+    legend=:topleft)
+# Añadir la segunda turbina al gráfico con el eje derecho
+plot!(h, Pw2_out[:, 2], 
+    linecolor="orange",          # Color de la línea para la segunda turbina
+    marker=:diamond,             # Estilo de marcador para la segunda turbina
+    markerstrokewidth=0.1,
+    markercolor="blue",          # Color de los puntos (marcadores)
+    label="Turbina 2 (kW x 100)", 
+    lw=1, 
+    right_axis=true)
+# Añadir la tercera turbina al gráfico con el eje derecho
+plot!(h, Pw2_out[:, 3], 
+    linecolor="purple",          # Color de la línea para la tercera turbina
+    marker=:square,              # Estilo de marcador para la tercera turbina
+    markerstrokewidth=0.1,
+    markercolor="yellow",        # Color de los puntos (marcadores)
+    label="Turbina 3 (kW x 100)", 
+    lw=1, 
+    right_axis=true)
+# Añadir la cuarta turbina al gráfico con el eje derecho
+plot!(h, Pw2_out[:, 4], 
+    linecolor="red",             # Color de la línea para la cuarta turbina
+    marker=:hexagon,             # Estilo de marcador para la cuarta turbina
+    markerstrokewidth=0.1,
+    markercolor="green",         # Color de los puntos (marcadores)
+    label="Turbina 4 (kW x 100)", 
+    lw=1, 
+    right_axis=true)
+# Añadir la quinta turbina al gráfico con el eje derecho
+plot!(h, Pw2_out[:, 5], 
+    linecolor="blue",            # Color de la línea para la quinta turbina
+    marker=:star5,               # Estilo de marcador para la quinta turbina
+    markerstrokewidth=0.1,
+    markercolor="purple",        # Color de los puntos (marcadores)
+    label="Turbina 5 (kW x 100)", 
+    lw=1, 
+    right_axis=true)
+# Añadir la sexta turbina al gráfico con el eje derecho
+plot!(h, Pw2_out[:, 6], 
+    linecolor="brown",           # Color de la línea para la sexta turbina
+    marker=:pentagon,            # Estilo de marcador para la sexta turbina
+    markerstrokewidth=0.1,
+    markercolor="pink",          # Color de los puntos (marcadores)
+    label="Turbina 6 (kW x 100)", 
+    lw=1, 
+    right_axis=true)
+plot(p1, p2, p3, p4, p5, p6, p7, p_wp, layout=(5,2), size=(1700, 2050))  # Ajustar tamaño y layout
+savefig("SISTEMA_BESS_DGU.pdf")
+#----------------------------------------VIDEO_DE_CORRIENTES_EN_EL_SISTEMA------------------------------------------#
+# Inicializar arrays/vectores para almacenar las pérdidas totales por hora
+Ptot_real_por_hora = zeros(24);
+Qtot_reactive_por_hora = zeros(24);
+Stot_loss_por_hora = complex(zeros(24);)
+S_base = 10;  # Base de potencia en MVA
+sqrt3 = sqrt(3);  # Constante para el sistema trifásico
+max_line = Int(maximum(T_lines[:, 6]));  # Número máximo de línea
+# Array para almacenar las gráficas
+plots_corrientes = [];
+for hora in 1:24
+    # Extraer las magnitudes y fases para la hora actual
+    magnitudes = magnitudes_horario[:, hora]
+    fases = fases_horario[:, hora]
+    # Calcular las pérdidas, flujos y corrientes para la hora actual
+    S_flow, corrientes_pu, corrientes_reales, Stot_loss, Ptot_real, Qtot_reactive, S_loss = calcular_flujos_y_perdidas_con_corrientes(T_lines, magnitudes, fases, Buses, S_base)
+
+    # Crear array de corrientes con 0 para líneas desconectadas
+    corrientes_totales = zeros(Float64, max_line)  # Inicializa un array de corrientes para todas las líneas
+
+    # Asigna valores de corriente para las líneas activas
+    index_real = 1  # índice para recorrer `corrientes_reales`
+    for i in 1:size(T_lines, 1)
+        if T_lines[i, 5] == 1.0  # Si la línea está conectada
+            line_id = Int(T_lines[i, 6])  # Obtener el ID de la línea
+            corrientes_totales[line_id] = corrientes_reales[index_real]  # Asigna la corriente real
+            index_real += 1  # Avanza en el índice de `corrientes_reales`
+        end
+    end
+    # Graficar la corriente para la hora actual
+    p = plot(1:max_line, corrientes_totales[1:max_line],
+             linecolor="blue",
+             marker=:circle,
+             markercolor="red",
+             markersize=2,
+             label="Hora $hora",
+             title="Corriente (A) - Hora $hora",
+             lw=1,
+             xticks=1:5:max_line,
+             yticks=0:75:750,
+             ylim=(0, 750),
+             grid=true,
+             gridalpha=0.99,
+             markerstrokewidth=0.07,
+             tickfontsize=12,
+             gridcolor=:gray,
+             legend=false,
+             size=(1000, 900))
+    # Agregar la gráfica al array de gráficos
+    push!(plots_corrientes, p);
+end
+# Mostrar todas las 24 gráficas en una ventana con un layout de 6 filas y 4 columnas
+plot(plots_corrientes..., layout=(6, 4), size=(2000, 2000), subplot_padding=1)
+# Guardar todas las gráficas en un archivo PDF
+savefig("CORRIENTES_BESS_DGU.pdf")
+
+#-----------------Save ALL CURRENTS'S SYSTEM into XLSX archive for using it in python----------------#
+# Array para almacenar las corrientes en las horas específicas (5, 11, 20)
+horas_interes = [5, 11, 20]
+corrientes_horas = Dict(hora => zeros(Float64, max_line) for hora in horas_interes)
+for hora in horas_interes
+    # Extraer las magnitudes y fases para la hora actual
+    magnitudes = magnitudes_horario[:, hora]
+    fases = fases_horario[:, hora]
+
+    # Calcular las pérdidas, flujos y corrientes para la hora actual
+    S_flow, corrientes_pu, corrientes_reales, Stot_loss, Ptot_real, Qtot_reactive, S_loss = calcular_flujos_y_perdidas_con_corrientes(T_lines, magnitudes, fases, Buses, S_base)
+
+    # Crear array de corrientes con 0 para líneas desconectadas
+    corrientes_totales = zeros(Float64, max_line)  # Inicializa un array de corrientes para todas las líneas
+
+    # Asigna valores de corriente para las líneas activas
+    index_real = 1  # índice para recorrer `corrientes_reales`
+    for i in 1:size(T_lines, 1)
+        if T_lines[i, 5] == 1.0  # Si la línea está conectada
+            line_id = Int(T_lines[i, 6])  # Obtener el ID de la línea
+            corrientes_totales[line_id] = corrientes_reales[index_real]  # Asigna la corriente real
+            index_real += 1  # Avanza en el índice de `corrientes_reales`
+        end
+    end
+
+    # Almacena las corrientes para la hora específica en el diccionario
+    corrientes_horas[hora] = corrientes_totales
+end
+# Crear el DataFrame para las corrientes en horas 5, 11 y 20
+data_corrientes = DataFrame(Línea = 1:max_line)
+for hora in horas_interes
+    data_corrientes[!, "Hora_$hora"] = corrientes_horas[hora]
+end
+# Guardar el DataFrame en un archivo Excel
+XLSX.writetable("CORRIENTES_BESS_Y_DGU_HORAS_5,11,20.xlsx", data_corrientes; sheetname="Corrientes")
+#println("Archivo 'CORRIENTES_HORAS_ESPECIFICAS.xlsx' creado exitosamente.")
+#-----------------------------------------------------------------------------------------------------#
+#-----------------------------------Grafica de los voltajes cada hora en cada bus----------------------------------#
+
+# Número de buses en el sistema
+n_buses = size(magnitudes_horario, 1);
+# Inicializar un array para almacenar las gráficas de voltajes por hora
+plots_voltajes = [];
+# Número de repeticiones
+n_repeticiones = 1;  # Este número controla cuántas veces se repiten las gráficas
+# Ciclo para mostrar las gráficas de voltajes por bus en cada hora
+for _ in 1:n_repeticiones  
+    for hora in 1:24
+        # Graficar los voltajes en todos los buses para la hora actual
+        p = plot(1:n_buses, magnitudes_horario[:, hora], 
+            linecolor="green",      # Color de la línea
+            marker=:circle,         # Estilo de marcador
+            markercolor="blue",     # Color de los puntos (marcadores)
+            label="Hora $hora", 
+            title="Voltaje (p.u) - Hora $hora", 
+            #ylabel="Voltaje (p.u.)", 
+            #xlabel=:, 
+            lw=1,                   # Grosor de la línea
+            #legend=:topleft,
+            xticks=1:3:n_buses,     # Etiquetas para cada bus
+            yticks=0.75:0.03:1.02,    # Ajusta los límites del eje Y según los valores de voltaje esperados
+            ylim=(0.75, 1.02),        # Establecer los límites del eje Y
+            grid=true,              # Activar la cuadrícula
+            gridalpha=0.99,         # Transparencia de la cuadrícula
+            markerstrokewidth=0.01,
+            labelpadding=-10,      # Sirve para ajustar la distancia entre las etiquetas y los ejes
+            tickfontsize=10,
+            gridcolor=:gray,
+            legend=false,
+            size=(1000, 900)) 
+             # Guardar la gráfica en el array
+              push!(plots_voltajes, p)     # Establecer el tamaño de la gráfica
+        # Mostrar la gráfica de la hora actual
+        display(p)        
+        # Pausa opcional para visualizar cada gráfica antes de continuar con la siguiente
+        sleep(0.1)  # Pausar por 2 segundos antes de pasar a la siguiente gráfica 
+    end
+end
+# Mostrar las 24 gráficas en una sola ventana
+plot(plots_voltajes..., layout=(8, 3), size=(2000, 2000), subplot_padding=1)  # 24 filas, 1 columna para acomodar las 24 gráficas
+savefig("VOLTAJES_BESS_DGU.pdf")  # Guardar el archivo
+
+#-----------------------------------Grafica de flujo de potencia aparente----------------------------------#
+# Obtener el número máximo de la línea conectada para el eje X
+max_connected_line = Int(maximum(T_lines[T_lines[:, 5] .== 1, 6]));
+# Inicializar un array para almacenar las gráficas del flujo de potencia aparente por hora
+plots_potencia_aparente = []
+# Iterar por cada hora y calcular el flujo de potencia aparente
+for hora in 1:24
+    # Extraer las magnitudes y fases para la hora actual
+    magnitudes = magnitudes_horario[:, hora]
+    fases = fases_horario[:, hora]
+    # Calcular las pérdidas, flujos y corrientes para la hora actual
+    S_flow, corrientes_pu, corrientes_reales, Stot_loss, Ptot_real, Qtot_reactive, S_loss = calcular_flujos_y_perdidas_con_corrientes(T_lines, magnitudes, fases, Buses, S_base)
+    # Inicializar un array para la potencia aparente incluyendo las líneas desconectadas
+    S_apparent_totales = zeros(size(T_lines, 1))  # Crear un array de ceros con el tamaño de todas las líneas
+    # Llenar con los valores de la potencia aparente solo para las líneas conectadas
+    index_flow = 1  # índice para recorrer `S_flow`
+    for i in 1:size(T_lines, 1)
+        if T_lines[i, 5] == 1.0  # Si la línea está conectada
+            S_apparent_totales[i] = abs(S_flow[index_flow]) * S_base  # Asigna la magnitud de la potencia aparente
+            index_flow += 1  # Incrementa el índice de `S_flow`
+        else
+            S_apparent_totales[i] = 0.0  # Si está desconectada, deja en 0
+        end
+    end
+    
+    # Crear la gráfica para la potencia aparente por línea en la hora actual, limitando el eje X
+    p = plot(1:max_connected_line, S_apparent_totales[1:max_connected_line], 
+        linecolor="green",      # Color de la línea
+        marker=:circle,         # Estilo de marcador
+        markercolor="red",      # Color de los puntos (marcadores)
+        markersize=3,           # Tamaño de los marcadores
+        label="Hora $hora", 
+        title="Flujo Potencia Aparente MVA - Hora $hora", 
+        lw=1,                   # Grosor de la línea
+        xticks=1:4:max_connected_line,  # Etiquetas para cada línea
+        yticks=0:2:18,          # Ajustar según los valores máximos
+        ylim=(0, 18),           # Ajustar los límites del eje Y
+        grid=true,              # Activar la cuadrícula
+        gridalpha=0.99,         # Transparencia de la cuadrícula
+        markerstrokewidth=0.03,
+        labelpadding=-10,       # Ajustar la distancia entre las etiquetas y los ejes
+        tickfontsize=10,
+        gridcolor=:gray,
+        legend=false, 
+        size=(1000, 900))       # Tamaño de la gráfica
+    
+    # Agregar la gráfica al array de gráficos
+    push!(plots_potencia_aparente, p)
+end
+
+# Mostrar todas las 24 gráficas en una ventana con un layout de 6 filas y 4 columnas
+plot(plots_potencia_aparente..., layout=(6, 4), size=(2000, 2000))
+# Guardar el archivo
+savefig("FLUJO_APARENTE_BESS_DGU.pdf")
+
+#--------------------------------------Saturacion_del_los_transformadores--------------------------------#
+# Crear una matriz para almacenar el flujo de potencia aparente de cada línea activa por hora
+S_flow_resultados = Dict(linea => [] for linea in [38, 43, 54, 56]);
+# Inicializar arrays para almacenar las pérdidas totales por hora
+Ptot_real_por_hora = zeros(24);
+Qtot_reactive_por_hora = zeros(24);
+Stot_loss_por_hora = complex(zeros(24));
+S_base = 10;  # Base de potencia en MVA
+
+# Iterar por cada hora y calcular los flujos de potencia
+for hora in 1:24
+    # Extraer las magnitudes y fases para la hora actual
+    magnitudes = magnitudes_horario[:, hora]
+    fases = fases_horario[:, hora]
+    
+    # Filtrar las líneas activas (con Estado == 1)
+    T_lines_activas = T_lines[T_lines[:, 5] .== 1, :]
+    
+    # Calcular las pérdidas, flujos y corrientes para la hora actual
+    S_flow, corrientes_pu, corrientes_reales, Stot_loss, Ptot_real, Qtot_reactive, S_loss = calcular_flujos_y_perdidas_con_corrientes(T_lines_activas, magnitudes, fases, Buses, S_base)
+    
+    # Guardar los valores de S_flow para las líneas de interés en el diccionario
+    for linea in [38, 43, 54, 56]
+        pos_linea = findfirst(==(linea), T_lines_activas[:, 6])  # Encontrar la posición de la línea en T_lines_activas
+        if pos_linea !== nothing  # Verificar si la línea está activa en esta hora
+            push!(S_flow_resultados[linea], abs(S_flow[pos_linea]) * S_base)  # Guardar el valor escalado de S_flow
+        else
+            push!(S_flow_resultados[linea], 0.0)  # Si la línea no está activa, agregar un valor de 0.0
+        end
+    end
+end
+
+# Graficar los flujos de potencia aparente de las líneas específicas
+plots_potencia_aparente_por_linea = [];
+niveles_referencia = [5.0, 2.0, 4.0, 0.5];  # Niveles de referencia para saturación en MVA
+
+# Iterar sobre cada línea de interés para graficar
+for (i, linea) in enumerate([38, 43, 54, 56])
+    # Extraer los valores de potencia aparente guardados para esta línea
+    S_apparent_por_hora = S_flow_resultados[linea]
+    
+    # Calcular el valor máximo de la potencia aparente para ajustar el eje Y dinámicamente
+    max_potencia_aparente = maximum(S_apparent_por_hora)
+    y_limit = max(max_potencia_aparente * 1.1, 2.5)  # Límite de Y con un 10% de margen o 2.5 mínimo
+    
+    # Crear la gráfica para esta línea a lo largo de las 24 horas
+    p = plot(1:24, S_apparent_por_hora, 
+        linecolor="blue",      # Color de la línea
+        marker=:circle,        # Estilo de marcador
+        markercolor="red",     # Color de los puntos (marcadores)
+        markersize=3,          # Tamaño de los marcadores
+        label="Línea $linea", 
+        title="Flujo de Potencia Aparente - Línea $linea", 
+        xlabel="Hora del Día", 
+        ylabel="Potencia Aparente (MVA)", 
+        lw=1,                  # Grosor de la línea
+        xticks=1:2:24,         # Etiquetas para cada hora
+        yticks=0:0.5:10,  # Etiquetas en el eje Y
+        ylim=(0, 10),     # Limitar el eje Y dinámicamente
+        grid=true,             # Activar la cuadrícula
+        gridalpha=1.0,         # Transparencia de la cuadrícula
+        markerstrokewidth=0.2,
+        tickfontsize=10,
+        titlefontsize=10,
+        ylabelfontsize=10,
+        xlabelfontsize=10,
+        gridcolor=:gray,
+        legend=false, 
+        size=(1000, 1000))     # Tamaño de la gráfica
+    
+    # Añadir la línea de referencia roja para el nivel de saturación
+    hline!([niveles_referencia[i]], color=:red, lw=2, linestyle=:dash, alpha=0.8, label="")
+    
+    # Agregar la gráfica al array de gráficos
+    push!(plots_potencia_aparente_por_linea, p)
+end
+
+# Mostrar las 4 gráficas, una para cada línea de interés
+p_final = plot(plots_potencia_aparente_por_linea..., layout=grid(2, 2), size=(1000, 1000))
+# Guardar todas las gráficas en un archivo PDF si es necesario
+savefig(p_final, "TRAFO_BESS_DGU.pdf")
+
+#-----------------Save TRAFO'S SATURATION into XLSX archive for using it in python----------------#
+# Crear el DataFrame con los datos de flujo de potencia
+horas = 1:24
+data = DataFrame(
+    Hora = horas,
+    Línea_38 = [S_flow_resultados[38][hora] for hora in horas],
+    Línea_43 = [S_flow_resultados[43][hora] for hora in horas],
+    Línea_54 = [S_flow_resultados[54][hora] for hora in horas],
+    Línea_56 = [S_flow_resultados[56][hora] for hora in horas]
+)
+# Guardar el DataFrame en un archivo Excel en una hoja llamada "Flujos de Potencia"
+XLSX.writetable("SATURACION_BESS.xlsx", data; sheetname="Flujos de Potencia")
+#println("Archivo 'Flujo_Potencia_Líneas.xlsx' creado exitosamente.")
+#-------------------------------------------------------------------------------------------------#
+
+#-------------------------------------------Grafico_bus_slack------------------------------------#
+
+
+
+# Calcular la potencia aparente a partir de la potencia activa y reactiva
+S_slack_horario = [sqrt(P^2 + Q^2) for (P, Q) in zip(P_slack_horario, Q_slack_horario)]
+# Crear el gráfico de la potencia activa
+plot(1:24, P_slack_horario, 
+    label="Potencia Activa (MW)", 
+    linecolor="blue", 
+    lw=2, 
+    marker=:circle, 
+    markersize=4,
+    xlabel="Hora del Día", 
+    ylabel="Potencia (MW/MVAr/MVA)",
+    title="Potencia del Bus Slack a lo largo del día",
+    legend=:topleft, 
+    grid=true,          # Activar la cuadrícula
+    gridcolor=:gray,    # Color de la cuadrícula
+    gridalpha=0.99)      # Transparencia de la cuadrícula
+# Añadir la potencia reactiva al gráfico
+plot!(1:24, Q_slack_horario, 
+    label="Potencia Reactiva (MVAr)", 
+    linecolor="red", 
+    lw=2, 
+    marker=:square, 
+    markersize=4,
+    grid=true)          # Reafirmar la cuadrícula
+# Añadir la potencia aparente al gráfico
+plot!(1:24, S_slack_horario, 
+    label="Potencia Aparente (MVA)", 
+    linecolor="green", 
+    lw=2, 
+    marker=:diamond, 
+    markersize=4,
+    grid=true)          # Reafirmar la cuadrícula
+# Añadir una línea horizontal en el límite de 15 (en el eje Y)
+hline!([15], color=:red, lw=2, linestyle=:dash, label=nothing)
+# Guardar la imagen como archivo PDF
+#savefig("potencia_slack_WITH_BESS_AND_OPDGU.pdf")
+"""
